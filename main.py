@@ -1,29 +1,44 @@
 import asyncio
+import os
 import random
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-BASE_POLL_INTERVAL = 60   # seconds
-MAX_POLL_INTERVAL  = 600  # backoff ceiling
+BASE_POLL_INTERVAL = 60
+MAX_POLL_INTERVAL  = 600
 
 PROVIDERS = [
-    {"url": "https://status.openai.com",       "name": "OpenAI",    "poll_interval": 60},
+    {"url": "https://status.openai.com", "name": "OpenAI", "poll_interval": 60},
     # {"url": "https://www.githubstatus.com",  "name": "GitHub",    "poll_interval": 30},
     # {"url": "https://status.anthropic.com",  "name": "Anthropic", "poll_interval": 60},
 ]
 
-# One timestamp per provider — O(1) storage, lost on restart (acceptable).
-# Swap for Redis only if multi-worker or stateless deployment is needed.
 watermarks: dict[str, datetime] = {}
+
+
+# ── Health server (runs in background thread for public URL) ───────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"status-tracker running")
+    def log_message(self, *args):
+        pass  # suppress access logs
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 
 # ── Poller ─────────────────────────────────────────────────────────────────────
 
 async def _poll(client: httpx.AsyncClient, url: str, name: str, etag: str | None) -> str | None:
-    # Conditional request — server returns 304 + no body if nothing changed (~95% bandwidth saved)
     headers = {"If-None-Match": etag} if etag else {}
 
     try:
@@ -37,7 +52,6 @@ async def _poll(client: httpx.AsyncClient, url: str, name: str, etag: str | None
     if resp.status_code != 200:
         raise RuntimeError(f"{name}: unexpected status {resp.status_code}")
 
-    # Parse before updating ETag — prevents silently skipping this version on parse failure
     try:
         data = resp.json()
     except Exception as exc:
@@ -47,10 +61,6 @@ async def _poll(client: httpx.AsyncClient, url: str, name: str, etag: str | None
 
     last_ts   = watermarks.get(name, datetime.min.replace(tzinfo=timezone.utc))
     newest_ts = last_ts
-
-    # On first run, silently advance watermark without printing history.
-    # Without this, every historical incident fires on startup as there is
-    # no prior watermark — producing a flood of old/empty updates.
     is_first_run = name not in watermarks
 
     for incident in data.get("incidents", []):
@@ -59,9 +69,7 @@ async def _poll(client: httpx.AsyncClient, url: str, name: str, etag: str | None
 
         for update in incident.get("incident_updates", []):
             update_ts = datetime.fromisoformat(update["updated_at"].replace("Z", "+00:00"))
-
             if update_ts > last_ts:
-                # Skip printing on first run and skip updates with empty body
                 if not is_first_run and update["body"].strip():
                     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Product: {product}")
                     print(f"Status:  {update['body']}\n")
@@ -76,7 +84,7 @@ async def _poll(client: httpx.AsyncClient, url: str, name: str, etag: str | None
 # ── Tracker ────────────────────────────────────────────────────────────────────
 
 async def _track(client: httpx.AsyncClient, url: str, name: str, poll_interval: int) -> None:
-    await asyncio.sleep(random.uniform(0, poll_interval))  # jitter — stagger startup across 500 tasks
+    await asyncio.sleep(random.uniform(0, poll_interval))
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Tracking {name}  →  {url}")
 
     etag: str | None = None
@@ -89,7 +97,7 @@ async def _track(client: httpx.AsyncClient, url: str, name: str, poll_interval: 
             await asyncio.sleep(poll_interval)
 
         except asyncio.CancelledError:
-            break  # clean shutdown — never `pass`, that breaks asyncio cancellation
+            break
 
         except Exception as exc:
             consecutive_failures += 1
@@ -101,6 +109,9 @@ async def _track(client: httpx.AsyncClient, url: str, name: str, poll_interval: 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 async def main():
+    # Start health server in background thread — enables public URL on Railway
+    threading.Thread(target=start_health_server, daemon=True).start()
+
     async with httpx.AsyncClient(timeout=30) as client:
         tasks = [
             asyncio.create_task(
